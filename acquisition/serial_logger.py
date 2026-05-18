@@ -65,28 +65,41 @@ def send_cmd(ser: serial.Serial, cmd: str):
     time.sleep(0.05)
 
 
-def wait_ready(ser: serial.Serial, timeout_s: float = 10.0) -> bool:
+def wait_ready(ser: serial.Serial, timeout_s: float = 12.0) -> bool:
     """Espera el mensaje READY del Arduino.
 
-    No usa in_waiting como guarda: readline() bloquea hasta timeout segundos,
-    lo que evita perder el READY si llega entre iteraciones.
+    Lee continuamente durante timeout_s segundos. Ignora silenciosamente las
+    líneas vacías y el garbage del bootloader mbed (bytes no UTF-8, líneas
+    de un solo carácter, etc.). Solo imprime líneas reconocibles.
     """
     t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout_s:
+    elapsed = lambda: time.monotonic() - t0
+
+    while elapsed() < timeout_s:
         try:
-            raw  = ser.readline()          # bloquea hasta Serial.timeout segundos
-            line = raw.decode("utf-8", errors="replace").strip()
+            raw = ser.readline()   # bloquea hasta ser.timeout segundos
         except serial.SerialException as e:
             print(f"  [Error Serial] {e}")
             return False
 
-        if line:
+        if not raw:
+            # readline expiró sin datos — seguir esperando
+            remaining = timeout_s - elapsed()
+            if remaining > 0:
+                continue
+            break
+
+        line = raw.decode("utf-8", errors="replace").strip()
+
+        # Ignorar garbage del bootloader (líneas con caracteres raros o vacías)
+        if line and all(32 <= ord(c) < 127 for c in line):
             print(f"  [Arduino] {line}")
 
         if line == "READY":
             return True
 
-        # Si llegó basura del bootloader (caracteres no ASCII) seguimos leyendo
+    print(f"  [Timeout] No se recibió READY en {timeout_s:.0f} s.")
+    print("  Sugerencia: desconecta y reconecta el USB, espera 5 s y reintenta.")
     return False
 
 
