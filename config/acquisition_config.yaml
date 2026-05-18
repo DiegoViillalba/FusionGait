@@ -1,0 +1,76 @@
+# Configuración de adquisición de datos
+# Modificar puertos según el sistema operativo y la sesión.
+
+# Puertos Serial (actualizar según la máquina de captura)
+serial_ports:
+  sensor_1_pelvis: "/dev/ttyACM0"     # macOS: /dev/cu.usbmodem*
+  sensor_2_thigh:  "/dev/ttyACM1"     # Windows: COM3, COM4, ...
+  sensor_3_ankle:  "/dev/ttyACM2"
+
+serial_baud: 115200
+serial_timeout_s: 2
+
+# Parámetros de muestreo
+sampling:
+  target_hz: 100
+  sample_period_us: 10000
+  max_gap_ms: 20          # gaps mayores se registran como advertencia
+  buffer_size: 512        # bytes del buffer de Serial en Arduino
+
+# Formato de mensaje Serial
+# Columnas enviadas por el Arduino (sin encabezado):
+# timestamp_arduino_ms, sensor_id, placement, ax, ay, az, gx, gy, gz
+message_format:
+  delimiter: ","
+  line_ending: "\n"
+  float_decimals: 4
+  fields:
+    - timestamp_arduino_ms
+    - sensor_id
+    - placement
+    - ax
+    - ay
+    - az
+    - gx
+    - gy
+    - gz
+
+# Columnas adicionales añadidas por el script Python en el CSV
+csv_extra_columns:
+  - timestamp_pc_ms   # epoch ms en el PC al recibir la línea
+  - label             # vacío durante adquisición
+  - trial_id
+  - subject_id
+
+# Directorio de salida por defecto
+output:
+  raw_dir: "data/raw"
+  labels_dir: "data/labels"
+  processed_dir: "data/processed"
+
+# Comandos del protocolo
+commands:
+  start:       "START"
+  stop:        "STOP"
+  sync:        "SYNC"
+  status:      "STATUS"
+  set_trial:   "SET_TRIAL:{trial_id}"
+  set_subject: "SET_SUBJECT:{subject_id}"
+
+# Sincronización
+sync:
+  method: "pc_timestamp + xcorr_post_hoc"
+  heel_tap_event: true    # el sujeto da 3 heel taps al inicio de cada trial
+  xcorr_channel: "acc_norm"
+  max_lag_ms: 200         # lag máximo esperado entre sensores
+
+# QC (Quality Control)
+qc:
+  min_odr_hz: 90
+  max_odr_hz: 110
+  max_nan_fraction: 0.001
+  max_gap_fraction: 0.01
+  accel_range_check_g: 16
+  gyro_range_check_dps: 2000
+  resting_acc_norm_expected_g: 1.0
+  resting_acc_norm_tolerance_g: 0.2

@@ -1,0 +1,47 @@
+# Configuración de sensores
+# Este archivo describe el hardware y posicionamiento de cada nodo.
+# Debe actualizarse si cambia algún Arduino o su posición.
+
+sensors:
+  - sensor_id: 1
+    placement: pelvis
+    description: "Zona lumbar / sacro, línea media posterior"
+    arduino_serial: ""          # rellenar con el número de serie del Arduino
+    orientation_notes: >
+      Eje Z apuntando hacia arriba (hacia la cabeza), eje X hacia adelante.
+      Ajustar si el sensor está invertido o rotado.
+    firmware_define: "SENSOR_ID 1"
+    color_marker: "rojo"        # cinta de color para identificar físicamente
+
+  - sensor_id: 2
+    placement: thigh
+    description: "Cara lateral del muslo derecho, ~10 cm sobre la rodilla"
+    arduino_serial: ""
+    orientation_notes: >
+      Eje Z apuntando hacia arriba (proximal), eje X hacia adelante.
+    firmware_define: "SENSOR_ID 2"
+    color_marker: "azul"
+
+  - sensor_id: 3
+    placement: ankle
+    description: "Cara lateral del tobillo derecho / espinilla distal"
+    arduino_serial: ""
+    orientation_notes: >
+      Eje Z apuntando hacia arriba (proximal), eje X hacia adelante.
+      Este sensor es el de referencia para detección automática de eventos.
+    firmware_define: "SENSOR_ID 3"
+    color_marker: "verde"
+
+# Clases de marcha
+gait_classes:
+  0: stance
+  1: swing
+  2: default
+
+# Ejes de la IMU LSM9DS1 en Arduino Nano 33 BLE Sense
+# Referencia: https://docs.arduino.cc/libraries/arduino_lsm9ds1/
+imu_axes:
+  accel_range_g: 4          # ±4g por defecto
+  gyro_range_dps: 2000      # ±2000°/s
+  accel_odr_hz: 119
+  gyro_odr_hz: 119

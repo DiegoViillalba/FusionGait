@@ -1,0 +1,147 @@
+# Configuración de modelos y pipeline de entrenamiento
+
+# Parámetros de ventaneo
+windowing:
+  fs_hz: 100
+  window_size_samples: 50     # 500 ms
+  window_step_samples: 25     # overlap 50%
+  min_label_coverage: 0.70   # 70% de la ventana debe ser de una sola clase
+  channels:                   # canales de la IMU
+    - ax
+    - ay
+    - az
+    - gx
+    - gy
+    - gz
+
+# Split de datos
+split:
+  strategy: "by_subject"      # opciones: by_trial, by_subject, loso
+  # Si strategy=by_subject:
+  train_subjects: []          # vacío = todos excepto val y test
+  val_subjects:   []
+  test_subjects:  []          # rellenar con subject_ids antes de entrenar
+  # NUNCA mezclar el mismo trial en train y test
+
+# Normalización
+normalization:
+  method: "z_score"           # opciones: z_score, min_max
+  compute_from: "train_only"  # SIEMPRE calcular stats solo sobre train
+  stats_output: "data/processed/stats.json"
+
+# Clases
+classes:
+  names: [stance, swing, default]
+  indices: [0, 1, 2]
+  weights: null               # null = calcular automáticamente por frecuencia inversa
+
+# Features manuales (para modelos clásicos)
+manual_features:
+  per_channel: [mean, std, min, max, energy, rms]
+  derived:
+    - acc_norm_mean
+    - acc_norm_std
+    - acc_norm_max
+    - gyro_norm_mean
+    - gyro_norm_std
+  # Total features = 6 canales × 6 stats + 5 derivadas = 41 por sensor
+
+# CNN 1D (modelo TinyML)
+cnn1d:
+  input_shape: [50, 6]        # [window_size, num_channels]
+  layers:
+    - type: Conv1D
+      filters: 16
+      kernel_size: 5
+      activation: relu
+      padding: valid
+    - type: MaxPooling1D
+      pool_size: 2
+    - type: Conv1D
+      filters: 32
+      kernel_size: 3
+      activation: relu
+      padding: valid
+    - type: GlobalAveragePooling1D
+    - type: Dense
+      units: 16
+      activation: relu
+    - type: Dropout
+      rate: 0.3
+    - type: Dense
+      units: 3
+      activation: softmax
+
+  training:
+    optimizer: adam
+    learning_rate: 0.001
+    batch_size: 32
+    epochs: 100
+    early_stopping_patience: 15
+    reduce_lr_patience: 8
+    reduce_lr_factor: 0.5
+
+  regularization:
+    l2: 0.0001
+    dropout: 0.3
+
+# MLP (sklearn)
+mlp:
+  hidden_layer_sizes: [64, 32]
+  activation: relu
+  max_iter: 300
+  random_state: 42
+
+# Random Forest
+random_forest:
+  n_estimators: 100
+  max_depth: 15
+  random_state: 42
+
+# Logistic Regression
+logistic_regression:
+  max_iter: 1000
+  random_state: 42
+  multi_class: multinomial
+
+# Exportación TFLite
+tflite:
+  quantization: int8
+  optimization: size
+  input_type: int8
+  output_type: int8
+  max_model_size_kb: 50
+  max_tensor_arena_kb: 50
+  output_path: "training/models/cnn1d_int8.tflite"
+  header_path: "firmware/common/model_data.h"
+
+# Métricas de evaluación
+evaluation:
+  metrics:
+    - accuracy
+    - f1_macro
+    - f1_per_class
+    - confusion_matrix
+    - inference_latency_ms
+    - model_size_kb
+  per_group:
+    - subject_id
+    - sensor_id
+    - placement
+
+# Fusión multisensor
+fusion:
+  # Votación simple (Milestone 12)
+  voting:
+    method: weighted           # opciones: majority, weighted, threshold
+    min_confidence: 0.5        # si max_prob < 0.5, reducir peso del voto
+    global_confidence_threshold: 0.6  # si score global < umbral → default
+    fallback_class: default
+
+  # Fusión avanzada (Milestone 13)
+  meta_classifier:
+    model: logistic_regression  # opciones: logistic_regression, mlp, decision_tree
+    input_features:
+      - probabilities_all_sensors  # 3×3 = 9 features
+      - confidence_scores          # 3 features (max_prob por sensor)
+    output_classes: [stance, swing, default]
