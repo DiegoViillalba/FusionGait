@@ -1,11 +1,22 @@
 # Configuración de adquisición de datos
 # Modificar puertos según el sistema operativo y la sesión.
 
-# Puertos Serial (actualizar según la máquina de captura)
-serial_ports:
-  sensor_1_pelvis: "/dev/ttyACM0"     # macOS: /dev/cu.usbmodem*
-  sensor_2_thigh:  "/dev/ttyACM1"     # Windows: COM3, COM4, ...
-  sensor_3_ankle:  "/dev/ttyACM2"
+# ─── Nodos (usado por serial_logger.py --multi y ble_logger.py) ──────────────
+# Para modo USB: ajusta los puertos con el resultado de: arduino-cli board list
+# Para modo BLE: los ble_names deben coincidir con BLE_DEVICE_NAME en config.h
+sensors:
+  - sensor_id: 1
+    placement: pelvis
+    port: "/dev/cu.usbmodem11401"   # ← actualizar con tu puerto real
+    ble_name: "GaitNode_1"
+  - sensor_id: 2
+    placement: thigh
+    port: "/dev/cu.usbmodem1201"   # ← ya sabes que este es el tuyo
+    ble_name: "GaitNode_2"
+  - sensor_id: 3
+    placement: ankle
+    port: "/dev/cu.usbmodem1301"   # ← actualizar con tu puerto real
+    ble_name: "GaitNode_3"
 
 serial_baud: 115200
 serial_timeout_s: 2
