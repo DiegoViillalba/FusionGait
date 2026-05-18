@@ -51,9 +51,12 @@ def list_arduino_ports():
     return ports
 
 
-def open_serial(port: str, baud: int = 115200, timeout: float = 3.0) -> serial.Serial:
+def open_serial(port: str, baud: int = 115200, timeout: float = 4.0) -> serial.Serial:
     ser = serial.Serial(port, baud, timeout=timeout)
-    time.sleep(2.0)   # esperar reset del Arduino tras abrir el puerto
+    # Pausa mínima para que el toggle DTR llegue al Arduino y arranque el reset.
+    # NO dormimos más de 0.5 s aquí porque READY llega a los ~2 s y no queremos
+    # perderlo. wait_ready se encarga de ignorar el garbage del bootloader.
+    time.sleep(0.5)
     return ser
 
 
@@ -62,16 +65,28 @@ def send_cmd(ser: serial.Serial, cmd: str):
     time.sleep(0.05)
 
 
-def wait_ready(ser: serial.Serial, timeout_s: float = 8.0) -> bool:
-    """Espera el mensaje READY del Arduino."""
+def wait_ready(ser: serial.Serial, timeout_s: float = 10.0) -> bool:
+    """Espera el mensaje READY del Arduino.
+
+    No usa in_waiting como guarda: readline() bloquea hasta timeout segundos,
+    lo que evita perder el READY si llega entre iteraciones.
+    """
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
-        if ser.in_waiting:
-            line = ser.readline().decode("utf-8", errors="replace").strip()
-            if line:
-                print(f"  [Arduino] {line}")
-            if line == "READY":
-                return True
+        try:
+            raw  = ser.readline()          # bloquea hasta Serial.timeout segundos
+            line = raw.decode("utf-8", errors="replace").strip()
+        except serial.SerialException as e:
+            print(f"  [Error Serial] {e}")
+            return False
+
+        if line:
+            print(f"  [Arduino] {line}")
+
+        if line == "READY":
+            return True
+
+        # Si llegó basura del bootloader (caracteres no ASCII) seguimos leyendo
     return False
 
 

@@ -23,10 +23,9 @@ void setup() {
   pinMode(LEDG, OUTPUT); digitalWrite(LEDG, HIGH);
   pinMode(LEDB, OUTPUT); digitalWrite(LEDB, HIGH);
 
-  // Esperar conexión Serial hasta 3 segundos (útil en debugging)
-  // En producción el script Python no necesita esperar el puerto
-  uint32_t t0 = millis();
-  while (!Serial && (millis() - t0 < 3000));
+  // No esperamos Serial: en el Nano 33 BLE Sense sobre mbed el puerto USB CDC
+  // siempre está disponible. Bloquear aquí haría que el sketch nunca arrancara
+  // si no hay un terminal abierto, y retrasaría el READY en el script Python.
 
   if (!IMU.begin()) {
     Serial.println("ERROR:IMU_NOT_FOUND");
