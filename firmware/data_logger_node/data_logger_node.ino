@@ -1,5 +1,11 @@
-#include <Arduino_LSM9DS1.h>
 #include "config.h"
+
+// Seleccionar librería IMU según la versión del hardware
+#if IMU_REV2
+  #include <Arduino_BMI270_BMM150.h>   // Nano 33 BLE Sense Rev2
+#else
+  #include <Arduino_LSM9DS1.h>          // Nano 33 BLE Sense original
+#endif
 
 // ─── Estado ──────────────────────────────────────────────────────────────────
 enum State { IDLE, CAPTURING };
@@ -8,6 +14,7 @@ static String     trial_id       = "t000";
 static String     subject_id     = "s000";
 static uint32_t   last_sample_us = 0;
 static uint32_t   sample_count   = 0;
+static String     cmd_buf        = "";   // acumulador de comando en curso
 
 // ─── Prototipos ───────────────────────────────────────────────────────────────
 static void process_command(const String& cmd);
@@ -27,23 +34,40 @@ void setup() {
   // siempre está disponible. Bloquear aquí haría que el sketch nunca arrancara
   // si no hay un terminal abierto, y retrasaría el READY en el script Python.
 
+  Serial.setTimeout(100);   // readStringUntil no bloqueará más de 100 ms
+
   if (!IMU.begin()) {
-    Serial.println("ERROR:IMU_NOT_FOUND");
     set_led(true, false, false);   // rojo
-    while (true) delay(500);
+    // Bucle parpadeante: el LED rojo indica error de IMU
+    while (true) {
+      if (Serial.available()) {
+        // Responder STATUS aunque la IMU falle, para que Python pueda diagnosticar
+        String s = Serial.readStringUntil('\n');
+        if (s.indexOf("STATUS") >= 0)
+          Serial.println("ERROR:IMU_NOT_FOUND");
+      }
+      delay(300);
+    }
   }
 
   set_led(false, false, true);    // azul = listo, esperando START
-  Serial.println("READY");
+  Serial.println("READY");        // útil si Python abre el puerto ANTES del boot
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-  // 1. Procesar comandos entrantes
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd.length() > 0) process_command(cmd);
+  // 1. Leer Serial byte a byte (no-bloqueante)
+  //    Acumula en cmd_buf hasta recibir '\n', luego procesa.
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      cmd_buf.trim();
+      if (cmd_buf.length() > 0) process_command(cmd_buf);
+      cmd_buf = "";
+    } else if (c != '\r') {
+      cmd_buf += c;
+      if (cmd_buf.length() > 64) cmd_buf = "";  // anti-desbordamiento
+    }
   }
 
   // 2. Captura periódica a SAMPLE_HZ Hz

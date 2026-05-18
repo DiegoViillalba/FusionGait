@@ -51,12 +51,10 @@ def list_arduino_ports():
     return ports
 
 
-def open_serial(port: str, baud: int = 115200, timeout: float = 4.0) -> serial.Serial:
+def open_serial(port: str, baud: int = 115200, timeout: float = 2.0) -> serial.Serial:
     ser = serial.Serial(port, baud, timeout=timeout)
-    # Pausa mínima para que el toggle DTR llegue al Arduino y arranque el reset.
-    # NO dormimos más de 0.5 s aquí porque READY llega a los ~2 s y no queremos
-    # perderlo. wait_ready se encarga de ignorar el garbage del bootloader.
-    time.sleep(0.5)
+    time.sleep(0.3)              # mínimo para que el DTR llegue
+    ser.reset_input_buffer()     # descartar basura pre-conexión
     return ser
 
 
@@ -65,41 +63,51 @@ def send_cmd(ser: serial.Serial, cmd: str):
     time.sleep(0.05)
 
 
-def wait_ready(ser: serial.Serial, timeout_s: float = 12.0) -> bool:
-    """Espera el mensaje READY del Arduino.
+def wait_ready(ser: serial.Serial, timeout_s: float = 10.0) -> bool:
+    """Handshake con el Arduino mediante polling de STATUS.
 
-    Lee continuamente durante timeout_s segundos. Ignora silenciosamente las
-    líneas vacías y el garbage del bootloader mbed (bytes no UTF-8, líneas
-    de un solo carácter, etc.). Solo imprime líneas reconocibles.
+    El sketch envía READY sólo en setup(), que ya pasó cuando Python abre el
+    puerto. En su lugar enviamos STATUS repetidamente; el Arduino responde desde
+    loop() con "STATUS:...". Esto funciona sin importar cuándo arrancó el sketch.
     """
     t0 = time.monotonic()
-    elapsed = lambda: time.monotonic() - t0
+    attempt = 0
 
-    while elapsed() < timeout_s:
+    while time.monotonic() - t0 < timeout_s:
+        attempt += 1
         try:
-            raw = ser.readline()   # bloquea hasta ser.timeout segundos
+            ser.write(b"STATUS\n")
         except serial.SerialException as e:
-            print(f"  [Error Serial] {e}")
+            print(f"  [Error] {e}")
             return False
 
-        if not raw:
-            # readline expiró sin datos — seguir esperando
-            remaining = timeout_s - elapsed()
-            if remaining > 0:
-                continue
-            break
+        # Esperar respuesta hasta 2 s por intento
+        t1 = time.monotonic()
+        while time.monotonic() - t1 < 2.0:
+            try:
+                raw = ser.readline()
+            except serial.SerialException as e:
+                print(f"  [Error] {e}")
+                return False
 
-        line = raw.decode("utf-8", errors="replace").strip()
+            if not raw:
+                break   # readline expiró, mandar otro STATUS
 
-        # Ignorar garbage del bootloader (líneas con caracteres raros o vacías)
-        if line and all(32 <= ord(c) < 127 for c in line):
-            print(f"  [Arduino] {line}")
+            line = raw.decode("utf-8", errors="replace").strip()
 
-        if line == "READY":
-            return True
+            # Imprimir sólo líneas ASCII legibles
+            if line and all(32 <= ord(c) < 127 for c in line):
+                print(f"  [Arduino] {line}")
 
-    print(f"  [Timeout] No se recibió READY en {timeout_s:.0f} s.")
-    print("  Sugerencia: desconecta y reconecta el USB, espera 5 s y reintenta.")
+            if line == "READY" or line.startswith("STATUS:") or line.startswith("ACK:"):
+                return True
+
+        remaining = timeout_s - (time.monotonic() - t0)
+        if remaining > 1:
+            print(f"  Sin respuesta, reintentando... ({remaining:.0f} s restantes)")
+
+    print(f"  [Timeout] El Arduino no respondió a STATUS en {timeout_s:.0f} s.")
+    print("  ¿El firmware está subido? Prueba: arduino-cli board list")
     return False
 
 
