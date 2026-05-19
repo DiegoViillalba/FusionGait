@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""
+gait_gui.py — Interfaz de adquisición de marcha por fases.
+
+Conecta 2-3 Arduinos por USB, muestra live plot y graba CSV
+con etiqueta de fase en tiempo real.
+
+Uso:
+    python3.11 acquisition/gait_gui.py
+
+Teclas:
+    1  →  Loading (Heel Strike)
+    2  →  Mid Stance
+    3  →  Terminal Stance
+    4  →  Swing
+    Space → Toggle grabar / detener
+
+Requiere:
+    pip install pyqtgraph PyQt6 pyserial numpy
+"""
+
+import collections
+import csv
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import serial
+import serial.tools.list_ports
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
+
+# ── Constantes ────────────────────────────────────────────────────────────────
+SAMPLE_HZ = 100
+BAUD_RATE  = 115200
+WINDOW_S   = 6
+DATA_DIR   = Path(__file__).parent.parent / "data" / "raw"
+
+PHASES = [
+    ("loading",   "1 · Loading HS",       "#e74c3c"),
+    ("midstance", "2 · Mid Stance",        "#f39c12"),
+    ("terminal",  "3 · Terminal Stance",   "#2ecc71"),
+    ("swing",     "4 · Swing",             "#3498db"),
+]
+
+PLACEMENTS = ["pelvis", "thigh", "ankle"]
+
+COLUMNS = [
+    "timestamp_pc_ms", "timestamp_arduino_ms",
+    "sensor_id", "placement", "phase",
+    "ax", "ay", "az", "gx", "gy", "gz",
+    "trial_id", "subject_id",
+]
+
+ACC_COLS    = ("ax", "ay", "az")
+GYRO_COLS   = ("gx", "gy", "gz")
+ACC_COLORS  = ("#e74c3c", "#2ecc71", "#3498db")
+GYRO_COLORS = ("#e67e22", "#1abc9c", "#9b59b6")
+
+
+# ── Un sensor USB ─────────────────────────────────────────────────────────────
+
+class SerialSensor:
+    """Gestiona un sensor USB: lectura en hilo, buffer para live plot y CSV."""
+
+    def __init__(self, port: str, sensor_id: int, placement: str):
+        self.port      = port
+        self.sensor_id = sensor_id
+        self.placement = placement
+
+        maxlen = WINDOW_S * SAMPLE_HZ * 2
+        self._times = collections.deque(maxlen=maxlen)
+        self._bufs  = {c: collections.deque(maxlen=maxlen)
+                       for c in ACC_COLS + GYRO_COLS}
+        self.total    = 0
+        self.odr_est  = 0.0
+        self._t0      = None
+        self._odr_ts  = time.monotonic()
+        self._odr_cnt = 0
+
+        self._lock    = threading.Lock()
+        self._ser     = None
+        self._thread  = None
+        self._running = False
+
+        self._writer          = None
+        self._csv_file        = None
+        self.recording        = False
+        self.samples_recorded = 0
+        self._phase           = "none"
+        self._trial_id        = ""
+        self._subject_id      = ""
+
+    # ── Conexión ──────────────────────────────────────────────────────────────
+
+    def connect(self) -> bool:
+        try:
+            self._ser = serial.Serial(self.port, BAUD_RATE, timeout=2.0)
+            time.sleep(0.3)
+            self._ser.reset_input_buffer()
+            return True
+        except Exception as e:
+            print(f"  ERR {self.port}: {e}")
+            return False
+
+    def handshake(self, timeout_s: float = 10.0) -> bool:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout_s:
+            self._ser.write(b"STATUS\n")
+            t1 = time.monotonic()
+            while time.monotonic() - t1 < 2.0:
+                raw = self._ser.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line.startswith("STATUS:") or line == "READY":
+                    return True
+        return False
+
+    def start_stream(self):
+        self._ser.write(b"START\n")
+        self._running = True
+        self._thread  = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def stop_stream(self):
+        self._running = False
+        try:
+            self._ser.write(b"STOP\n")
+        except Exception:
+            pass
+
+    # ── CSV ───────────────────────────────────────────────────────────────────
+
+    def open_csv(self, subject_id: str, trial_id: str, out_dir: Path) -> Path:
+        self._subject_id = subject_id
+        self._trial_id   = trial_id
+        ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = out_dir / f"{subject_id}_{trial_id}_s{self.sensor_id}_{self.placement}_{ts}.csv"
+        self._csv_file = open(fname, "w", newline="", encoding="utf-8")
+        self._writer   = csv.DictWriter(self._csv_file, fieldnames=COLUMNS)
+        self._writer.writeheader()
+        self.samples_recorded = 0
+        self.recording = True
+        return fname
+
+    def close_csv(self):
+        self.recording = False
+        if self._csv_file:
+            self._csv_file.flush()
+            self._csv_file.close()
+            self._csv_file = None
+            self._writer   = None
+
+    def set_phase(self, phase: str):
+        self._phase = phase
+
+    # ── Lectura ───────────────────────────────────────────────────────────────
+
+    def _read_loop(self):
+        while self._running:
+            try:
+                raw = self._ser.readline()
+            except serial.SerialException:
+                break
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line or not line[0].isdigit():
+                continue
+            parts = line.split(",")
+            if len(parts) != 9:
+                continue
+
+            ts_pc = int(time.monotonic_ns() // 1_000_000)
+            try:
+                ts_ard = int(parts[0])
+                ax = float(parts[3]); ay = float(parts[4]); az = float(parts[5])
+                gx = float(parts[6]); gy = float(parts[7]); gz = float(parts[8])
+            except ValueError:
+                continue
+
+            if self._t0 is None:
+                self._t0 = ts_ard
+            t_rel = (ts_ard - self._t0) / 1000.0
+
+            with self._lock:
+                self._times.append(t_rel)
+                self._bufs["ax"].append(ax); self._bufs["ay"].append(ay)
+                self._bufs["az"].append(az); self._bufs["gx"].append(gx)
+                self._bufs["gy"].append(gy); self._bufs["gz"].append(gz)
+                self.total    += 1
+                self._odr_cnt += 1
+                now = time.monotonic()
+                if now - self._odr_ts >= 2.0:
+                    self.odr_est  = self._odr_cnt / (now - self._odr_ts)
+                    self._odr_cnt = 0
+                    self._odr_ts  = now
+
+                if self.recording and self._writer:
+                    self._writer.writerow({
+                        "timestamp_pc_ms":      ts_pc,
+                        "timestamp_arduino_ms": parts[0],
+                        "sensor_id":            parts[1],
+                        "placement":            parts[2],
+                        "phase":                self._phase,
+                        "ax": parts[3], "ay": parts[4], "az": parts[5],
+                        "gx": parts[6], "gy": parts[7], "gz": parts[8],
+                        "trial_id":   self._trial_id,
+                        "subject_id": self._subject_id,
+                    })
+                    self.samples_recorded += 1
+
+    def snapshot(self):
+        with self._lock:
+            t = np.array(self._times)
+            d = {c: np.array(self._bufs[c]) for c in ACC_COLS + GYRO_COLS}
+            return t, d, self.total, self.odr_est
+
+    def close(self):
+        self._running = False
+        self.close_csv()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if self._ser:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+
+
+# ── Ventana principal ─────────────────────────────────────────────────────────
+
+class GaitWindow(QtWidgets.QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.sensors: list[SerialSensor] = []
+        self.recording       = False
+        self.current_phase   = PHASES[0][0]
+        self._setup_ui()
+
+        self._timer = QtCore.QTimer()
+        self._timer.timeout.connect(self._update_plots)
+        self._timer.start(50)   # 20 Hz refresh
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _setup_ui(self):
+        self.setWindowTitle("FusionGait — Adquisición por Fases")
+        self.resize(1400, 820)
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root = QtWidgets.QVBoxLayout(central)
+        root.setSpacing(6)
+        root.setContentsMargins(10, 10, 10, 10)
+
+        # ── Top bar ───────────────────────────────────────────────────────
+        top = QtWidgets.QHBoxLayout()
+
+        top.addWidget(self._label("Sujeto:"))
+        self.subject_edit = QtWidgets.QLineEdit("s001")
+        self.subject_edit.setMaximumWidth(70)
+        top.addWidget(self.subject_edit)
+
+        top.addSpacing(10)
+        top.addWidget(self._label("Trial:"))
+        self.trial_edit = QtWidgets.QLineEdit("t001")
+        self.trial_edit.setMaximumWidth(70)
+        top.addWidget(self.trial_edit)
+
+        top.addSpacing(10)
+        top.addWidget(self._label("Sensores:"))
+        self.n_spin = QtWidgets.QSpinBox()
+        self.n_spin.setRange(1, 3)
+        self.n_spin.setValue(2)
+        self.n_spin.setMaximumWidth(50)
+        top.addWidget(self.n_spin)
+
+        top.addSpacing(10)
+        self.connect_btn = QtWidgets.QPushButton("Conectar")
+        self.connect_btn.setStyleSheet(
+            "background:#27ae60; color:white; font-weight:bold; padding:5px 16px; border-radius:4px;")
+        self.connect_btn.clicked.connect(self._on_connect)
+        top.addWidget(self.connect_btn)
+
+        self.conn_status = QtWidgets.QLabel("● Desconectado")
+        self.conn_status.setStyleSheet("color:#e74c3c; font-weight:bold; margin-left:8px;")
+        top.addWidget(self.conn_status)
+
+        top.addStretch()
+
+        self.out_label = QtWidgets.QLabel(f"→ {DATA_DIR}")
+        self.out_label.setStyleSheet("color:#666; font-size:11px;")
+        top.addWidget(self.out_label)
+
+        root.addLayout(top)
+
+        # ── Plots ─────────────────────────────────────────────────────────
+        pg.setConfigOptions(antialias=True, background="#12121f", foreground="#ddd")
+        self.plot_widget = pg.GraphicsLayoutWidget()
+        self.plot_widget.setMinimumHeight(420)
+        root.addWidget(self.plot_widget, stretch=1)
+        self._plots = []
+        self._rebuild_plots(self.n_spin.value())
+
+        # ── Selector de fases ─────────────────────────────────────────────
+        phase_bar = QtWidgets.QFrame()
+        phase_bar.setStyleSheet(
+            "QFrame { background:#0d0d1a; border-radius:6px; padding:2px; }")
+        phase_layout = QtWidgets.QHBoxLayout(phase_bar)
+        phase_layout.setContentsMargins(8, 4, 8, 4)
+        phase_layout.setSpacing(8)
+        phase_layout.addWidget(self._label("FASE ACTUAL:", bold=True))
+
+        self.phase_btns: list[QtWidgets.QPushButton] = []
+        for pid, label, color in PHASES:
+            btn = QtWidgets.QPushButton(label)
+            btn.setCheckable(True)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background:{color}33; color:#ddd;
+                    border:2px solid {color}88;
+                    border-radius:4px; padding:6px 18px;
+                    font-size:13px; font-weight:bold;
+                }}
+                QPushButton:checked {{
+                    background:{color}; color:#fff;
+                    border:2px solid {color};
+                }}
+                QPushButton:hover {{ background:{color}66; }}
+            """)
+            btn.clicked.connect(lambda _, p=pid: self._select_phase(p))
+            phase_layout.addWidget(btn)
+            self.phase_btns.append(btn)
+
+        self.phase_btns[0].setChecked(True)
+        phase_layout.addStretch()
+        root.addWidget(phase_bar)
+
+        # ── Barra de grabación ────────────────────────────────────────────
+        rec_bar = QtWidgets.QHBoxLayout()
+        rec_bar.setContentsMargins(0, 4, 0, 0)
+
+        self.record_btn = QtWidgets.QPushButton("● GRABAR  [Space]")
+        self.record_btn.setMinimumHeight(42)
+        self.record_btn.setMinimumWidth(200)
+        self.record_btn.setStyleSheet(self._rec_style(False))
+        self.record_btn.setEnabled(False)
+        self.record_btn.clicked.connect(self._toggle_record)
+        rec_bar.addWidget(self.record_btn)
+
+        self.phase_ind = QtWidgets.QLabel("Fase: —")
+        self.phase_ind.setStyleSheet("color:#aaa; font-size:13px; margin-left:14px;")
+        rec_bar.addWidget(self.phase_ind)
+
+        rec_bar.addStretch()
+
+        self.sample_lbl = QtWidgets.QLabel("Muestras: 0")
+        self.sample_lbl.setStyleSheet("color:#aaa; font-size:12px;")
+        rec_bar.addWidget(self.sample_lbl)
+
+        self.odr_lbl = QtWidgets.QLabel("ODR: — Hz")
+        self.odr_lbl.setStyleSheet("color:#aaa; font-size:12px; margin-left:14px;")
+        rec_bar.addWidget(self.odr_lbl)
+
+        root.addLayout(rec_bar)
+
+    # ── Helpers UI ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _label(text: str, bold: bool = False) -> QtWidgets.QLabel:
+        lbl = QtWidgets.QLabel(text)
+        if bold:
+            lbl.setStyleSheet("font-weight:bold; font-size:13px;")
+        return lbl
+
+    @staticmethod
+    def _rec_style(recording: bool) -> str:
+        if recording:
+            return ("background:#27ae60; color:white; font-weight:bold; "
+                    "font-size:14px; border-radius:4px; padding:8px 24px;")
+        return ("background:#c0392b; color:white; font-weight:bold; "
+                "font-size:14px; border-radius:4px; padding:8px 24px;")
+
+    def _rebuild_plots(self, n: int):
+        self.plot_widget.clear()
+        self._plots = []
+        for col in range(n):
+            place = PLACEMENTS[col]
+            sp = {}
+
+            p_acc = self.plot_widget.addPlot(row=0, col=col,
+                                             title=f"{place} — Aceleración (g)")
+            p_acc.addLegend(offset=(5, 5))
+            p_acc.setYRange(-3, 3)
+            p_acc.showGrid(x=True, y=True, alpha=0.25)
+            ca = {c: p_acc.plot([], [], name=c,
+                                pen=pg.mkPen(ACC_COLORS[i], width=1.5))
+                  for i, c in enumerate(ACC_COLS)}
+            sp["acc"] = (p_acc, ca)
+
+            p_gyr = self.plot_widget.addPlot(row=1, col=col,
+                                             title=f"{place} — Giroscopio (°/s)")
+            p_gyr.addLegend(offset=(5, 5))
+            p_gyr.setYRange(-500, 500)
+            p_gyr.showGrid(x=True, y=True, alpha=0.25)
+            cg = {c: p_gyr.plot([], [], name=c,
+                                pen=pg.mkPen(GYRO_COLORS[i], width=1.5))
+                  for i, c in enumerate(GYRO_COLS)}
+            sp["gyr"] = (p_gyr, cg)
+
+            self._plots.append(sp)
+
+    # ── Conexión ──────────────────────────────────────────────────────────────
+
+    def _on_connect(self):
+        n = self.n_spin.value()
+
+        ports = sorted(
+            p.device for p in serial.tools.list_ports.comports()
+            if "usbmodem" in p.device or "Arduino" in (p.description or "")
+        )
+
+        if len(ports) < n:
+            QtWidgets.QMessageBox.warning(
+                self, "Sin puertos",
+                f"Se necesitan {n} Arduino(s). Detectados: {len(ports)}\n"
+                + (f"Puertos: {ports}" if ports else "Ninguno encontrado.")
+            )
+            return
+
+        self.connect_btn.setEnabled(False)
+        self.conn_status.setText("● Conectando…")
+        self.conn_status.setStyleSheet("color:#f39c12; font-weight:bold;")
+        QtWidgets.QApplication.processEvents()
+
+        for s in self.sensors:
+            s.close()
+        self.sensors = []
+
+        for i in range(n):
+            s = SerialSensor(ports[i], i + 1, PLACEMENTS[i])
+            if not s.connect():
+                self._conn_error(f"No se pudo abrir {ports[i]}")
+                return
+            self.conn_status.setText(f"● Handshake S{i+1}…")
+            QtWidgets.QApplication.processEvents()
+            if not s.handshake():
+                self._conn_error(f"Sensor {i+1} ({ports[i]}) no respondió")
+                return
+            self.sensors.append(s)
+
+        self._rebuild_plots(n)
+        for s in self.sensors:
+            s.start_stream()
+
+        self.conn_status.setText(f"● {n} sensor(es) conectados")
+        self.conn_status.setStyleSheet("color:#2ecc71; font-weight:bold;")
+        self.record_btn.setEnabled(True)
+        self.connect_btn.setEnabled(True)
+        self._select_phase(PHASES[0][0])
+
+    def _conn_error(self, msg: str):
+        QtWidgets.QMessageBox.critical(self, "Error de conexión", msg)
+        self.conn_status.setText("● Error")
+        self.conn_status.setStyleSheet("color:#e74c3c; font-weight:bold;")
+        self.connect_btn.setEnabled(True)
+
+    # ── Fases ─────────────────────────────────────────────────────────────────
+
+    def _select_phase(self, phase_id: str):
+        self.current_phase = phase_id
+        for s in self.sensors:
+            s.set_phase(phase_id)
+        for i, (pid, label, color) in enumerate(PHASES):
+            self.phase_btns[i].setChecked(pid == phase_id)
+        label = next(lbl for pid, lbl, _ in PHASES if pid == phase_id)
+        self.phase_ind.setText(f"Fase: {label}")
+
+    # ── Grabación ─────────────────────────────────────────────────────────────
+
+    def _toggle_record(self):
+        if not self.recording:
+            self._start_recording()
+        else:
+            self._stop_recording()
+
+    def _start_recording(self):
+        subject = self.subject_edit.text().strip() or "s001"
+        trial   = self.trial_edit.text().strip() or "t001"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+        for s in self.sensors:
+            fname = s.open_csv(subject, trial, DATA_DIR)
+            s.set_phase(self.current_phase)
+            print(f"  Grabando → {fname}")
+
+        self.recording = True
+        self.record_btn.setText("■ DETENER  [Space]")
+        self.record_btn.setStyleSheet(self._rec_style(True))
+
+    def _stop_recording(self):
+        for s in self.sensors:
+            s.close_csv()
+        self.recording = False
+        total = sum(s.samples_recorded for s in self.sensors)
+        secs  = total / (SAMPLE_HZ * max(1, len(self.sensors)))
+        self.record_btn.setText("● GRABAR  [Space]")
+        self.record_btn.setStyleSheet(self._rec_style(False))
+        self.sample_lbl.setText("Muestras: 0")
+        QtWidgets.QMessageBox.information(
+            self, "Trial guardado",
+            f"Archivo guardado en {DATA_DIR}\n"
+            f"Muestras totales: {total}  ({secs:.1f} s)"
+        )
+
+    # ── Actualización de plots ────────────────────────────────────────────────
+
+    def _update_plots(self):
+        total_samples = 0
+        odr_vals      = []
+
+        for i, s in enumerate(self.sensors):
+            if i >= len(self._plots):
+                break
+            t, d, total, odr = s.snapshot()
+            total_samples += total
+            if odr > 0:
+                odr_vals.append(odr)
+
+            if len(t) < 2:
+                continue
+
+            mask = t >= (t[-1] - WINDOW_S)
+            _, ca = self._plots[i]["acc"]
+            _, cg = self._plots[i]["gyr"]
+            for c in ACC_COLS:
+                ca[c].setData(t[mask], d[c][mask])
+            for c in GYRO_COLS:
+                cg[c].setData(t[mask], d[c][mask])
+
+        if self.recording:
+            rec = sum(s.samples_recorded for s in self.sensors)
+            secs = rec / (SAMPLE_HZ * max(1, len(self.sensors)))
+            self.sample_lbl.setText(f"Grabando: {rec} muestras  ({secs:.1f} s)")
+        else:
+            self.sample_lbl.setText(f"Muestras en buffer: {total_samples}")
+
+        if odr_vals:
+            self.odr_lbl.setText(f"ODR: {np.mean(odr_vals):.0f} Hz")
+
+    # ── Teclado ───────────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        key = event.text()
+        if key == " " and self.record_btn.isEnabled():
+            self._toggle_record()
+        elif key in "1234":
+            idx = int(key) - 1
+            if idx < len(PHASES):
+                self._select_phase(PHASES[idx][0])
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        if self.recording:
+            self._stop_recording()
+        for s in self.sensors:
+            s.close()
+        event.accept()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    pal = QtGui.QPalette()
+    dark = {
+        QtGui.QPalette.ColorRole.Window:          "#1a1a2e",
+        QtGui.QPalette.ColorRole.WindowText:      "#eeeeee",
+        QtGui.QPalette.ColorRole.Base:            "#16213e",
+        QtGui.QPalette.ColorRole.AlternateBase:   "#0f3460",
+        QtGui.QPalette.ColorRole.Button:          "#16213e",
+        QtGui.QPalette.ColorRole.ButtonText:      "#eeeeee",
+        QtGui.QPalette.ColorRole.Text:            "#eeeeee",
+        QtGui.QPalette.ColorRole.Highlight:       "#3498db",
+        QtGui.QPalette.ColorRole.HighlightedText: "#ffffff",
+    }
+    for role, color in dark.items():
+        pal.setColor(role, QtGui.QColor(color))
+    app.setPalette(pal)
+
+    win = GaitWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

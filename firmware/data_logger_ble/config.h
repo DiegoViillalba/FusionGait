@@ -1,8 +1,8 @@
 #pragma once
 
 // ─── EDITAR ANTES DE SUBIR A CADA ARDUINO ───────────────────────────────────
-#define SENSOR_ID  3
-#define PLACEMENT  "ankle"
+#define SENSOR_ID  2
+#define PLACEMENT  "thigh"
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── VERSIÓN DE HARDWARE ─────────────────────────────────────────────────────
@@ -18,7 +18,7 @@
 // Nombre BLE del dispositivo — debe ser único por nodo
 // El script Python busca dispositivos con prefijo "GaitNode"
 // Cambia el sufijo según SENSOR_ID: GaitNode_1, GaitNode_2, GaitNode_3
-#define BLE_DEVICE_NAME  "GaitNode_3"
+#define BLE_DEVICE_NAME  "GaitNode_2"
 
 // ─── UUIDs GATT (no modificar) ───────────────────────────────────────────────
 // Servicio principal
