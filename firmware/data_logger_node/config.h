@@ -5,8 +5,8 @@
 //   Nodo 1: SENSOR_ID 1, PLACEMENT "pelvis"
 //   Nodo 2: SENSOR_ID 2, PLACEMENT "thigh"
 //   Nodo 3: SENSOR_ID 3, PLACEMENT "ankle"
-#define SENSOR_ID  3
-#define PLACEMENT  "ankle"
+#define SENSOR_ID  1
+#define PLACEMENT  "pelvis"
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── VERSIÓN DEL HARDWARE ─────────────────────────────────────────────────────

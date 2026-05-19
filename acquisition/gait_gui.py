@@ -81,10 +81,11 @@ class SerialSensor:
         self._odr_ts  = time.monotonic()
         self._odr_cnt = 0
 
-        self._lock    = threading.Lock()
-        self._ser     = None
-        self._thread  = None
-        self._running = False
+        self._lock       = threading.Lock()
+        self._ser        = None
+        self._thread     = None
+        self._running    = False
+        self.thread_alive = False
 
         self._writer          = None
         self._csv_file        = None
@@ -121,8 +122,13 @@ class SerialSensor:
         return False
 
     def start_stream(self):
+        self._ser.reset_input_buffer()   # limpiar basura acumulada durante handshake
+        time.sleep(0.05)
         self._ser.write(b"START\n")
+        print(f"  [S{self.sensor_id}/{self.placement}] START enviado a {self.port}")
         self._running = True
+        self.thread_alive = True
+        self._diag_lines = 0            # para imprimir las primeras líneas recibidas
         self._thread  = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
@@ -161,18 +167,36 @@ class SerialSensor:
     # ── Lectura ───────────────────────────────────────────────────────────────
 
     def _read_loop(self):
+        try:
+            self._read_loop_inner()
+        except Exception as e:
+            print(f"  [S{self.sensor_id}/{self.placement}] ERROR en hilo: {e}")
+        finally:
+            self.thread_alive = False
+            print(f"  [S{self.sensor_id}/{self.placement}] Hilo de lectura terminado")
+
+    def _read_loop_inner(self):
         while self._running:
             try:
                 raw = self._ser.readline()
-            except serial.SerialException:
+            except serial.SerialException as e:
+                print(f"  [S{self.sensor_id}] SerialException: {e}")
                 break
             if not raw:
                 continue
             line = raw.decode("utf-8", errors="replace").strip()
             if not line or not line[0].isdigit():
+                if line:
+                    print(f"  [S{self.sensor_id}/{self.placement}] ctrl: {line}")
                 continue
+
+            # Imprimir las primeras 3 líneas de datos para confirmar formato
+            if self._diag_lines < 3:
+                print(f"  [S{self.sensor_id}/{self.placement}] datos: {line[:80]}")
+                self._diag_lines += 1
             parts = line.split(",")
             if len(parts) != 9:
+                print(f"  [S{self.sensor_id}] línea malformada ({len(parts)} campos): {line[:60]}")
                 continue
 
             ts_pc = int(time.monotonic_ns() // 1_000_000)
@@ -180,7 +204,8 @@ class SerialSensor:
                 ts_ard = int(parts[0])
                 ax = float(parts[3]); ay = float(parts[4]); az = float(parts[5])
                 gx = float(parts[6]); gy = float(parts[7]); gz = float(parts[8])
-            except ValueError:
+            except ValueError as e:
+                print(f"  [S{self.sensor_id}] ValueError: {e} en '{line[:60]}'")
                 continue
 
             if self._t0 is None:
@@ -370,6 +395,12 @@ class GaitWindow(QtWidgets.QMainWindow):
 
         root.addLayout(rec_bar)
 
+        # ── Status por sensor ─────────────────────────────────────────────
+        self.sensor_status_bar = QtWidgets.QHBoxLayout()
+        self.sensor_status_bar.setContentsMargins(0, 2, 0, 0)
+        self.sensor_lbls: list[QtWidgets.QLabel] = []
+        root.addLayout(self.sensor_status_bar)
+
     # ── Helpers UI ────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -456,6 +487,19 @@ class GaitWindow(QtWidgets.QMainWindow):
             self.sensors.append(s)
 
         self._rebuild_plots(n)
+
+        # Crear labels de estado por sensor
+        for lbl in self.sensor_lbls:
+            self.sensor_status_bar.removeWidget(lbl)
+            lbl.deleteLater()
+        self.sensor_lbls = []
+        for s in self.sensors:
+            lbl = QtWidgets.QLabel(f"S{s.sensor_id}/{s.placement}: iniciando…")
+            lbl.setStyleSheet("color:#f39c12; font-size:11px; padding:0 10px;")
+            self.sensor_status_bar.addWidget(lbl)
+            self.sensor_lbls.append(lbl)
+        self.sensor_status_bar.addStretch()
+
         for s in self.sensors:
             s.start_stream()
 
@@ -530,8 +574,23 @@ class GaitWindow(QtWidgets.QMainWindow):
                 break
             t, d, total, odr = s.snapshot()
             total_samples += total
-            if odr > 0:
-                odr_vals.append(odr)
+
+            # Actualizar label de estado por sensor
+            if i < len(self.sensor_lbls):
+                lbl = self.sensor_lbls[i]
+                if not s.thread_alive and total == 0:
+                    lbl.setText(f"S{s.sensor_id}/{s.placement}: sin datos")
+                    lbl.setStyleSheet("color:#e74c3c; font-size:11px; padding:0 10px;")
+                elif not s.thread_alive:
+                    lbl.setText(f"S{s.sensor_id}/{s.placement}: hilo caído ⚠")
+                    lbl.setStyleSheet("color:#e74c3c; font-size:11px; padding:0 10px;")
+                elif odr > 0:
+                    lbl.setText(f"S{s.sensor_id}/{s.placement}: {odr:.0f} Hz  ✓")
+                    lbl.setStyleSheet("color:#2ecc71; font-size:11px; padding:0 10px;")
+                    odr_vals.append(odr)
+                else:
+                    lbl.setText(f"S{s.sensor_id}/{s.placement}: esperando datos…")
+                    lbl.setStyleSheet("color:#f39c12; font-size:11px; padding:0 10px;")
 
             if len(t) < 2:
                 continue
