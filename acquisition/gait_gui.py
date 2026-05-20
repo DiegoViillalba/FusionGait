@@ -46,9 +46,9 @@ PHASES = [
     ("swing",     "4 · Swing",             "#3498db"),
 ]
 
-PLACEMENTS         = ["pelvis", "thigh", "ankle"]        # defaults internos
 PLACEMENT_OPTIONS  = ["cadera", "pierna", "peroné", "tobillo"]
-PLACEMENT_DEFAULTS = ["cadera", "pierna", "tobillo"]     # default por sensor
+PLACEMENT_DEFAULTS = ["cadera", "pierna", "peroné", "tobillo"]  # default por sensor (hasta 4)
+MAX_SENSORS        = 4   # máximo de Arduinos soportados por la GUI
 
 COLUMNS = [
     "timestamp_pc_ms", "timestamp_arduino_ms",
@@ -303,7 +303,7 @@ class GaitWindow(QtWidgets.QMainWindow):
         top.addSpacing(10)
         top.addWidget(self._label("Sensores:"))
         self.n_spin = QtWidgets.QSpinBox()
-        self.n_spin.setRange(1, 3)
+        self.n_spin.setRange(1, MAX_SENSORS)
         self.n_spin.setValue(2)
         self.n_spin.setMaximumWidth(50)
         top.addWidget(self.n_spin)
@@ -336,7 +336,7 @@ class GaitWindow(QtWidgets.QMainWindow):
 
         self.placement_combos: list[QtWidgets.QComboBox] = []
         self._placement_labels: list[QtWidgets.QLabel] = []
-        for i in range(3):
+        for i in range(MAX_SENSORS):
             lbl = self._label(f"S{i+1}:")
             lbl.setStyleSheet("color:#aaa; font-size:12px;")
             self._placement_labels.append(lbl)
@@ -466,7 +466,7 @@ class GaitWindow(QtWidgets.QMainWindow):
         self._plots = []
         for col in range(n):
             place = (placements[col] if placements and col < len(placements)
-                     else PLACEMENTS[col] if col < len(PLACEMENTS) else f"S{col+1}")
+                     else PLACEMENT_DEFAULTS[col] if col < len(PLACEMENT_DEFAULTS) else f"S{col+1}")
             sp = {}
 
             p_acc = self.plot_widget.addPlot(row=0, col=col,
