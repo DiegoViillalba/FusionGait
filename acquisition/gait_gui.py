@@ -2,8 +2,12 @@
 """
 gait_gui.py — Interfaz de adquisición de marcha por fases.
 
-Conecta 2-3 Arduinos por USB, muestra live plot y graba CSV
-con etiqueta de fase en tiempo real.
+Modos de operación
+──────────────────
+• USB directo (por defecto): conecta N Arduinos por USB independientes.
+• Hub BLE (checkbox "Hub BLE"): conecta 1 Arduino hub (data_logger_hub)
+  que retransmite datos de hasta 2 sensores BLE inalámbricos y su propia
+  IMU, todo por un único puerto USB Serial.
 
 Uso:
     python3.11 acquisition/gait_gui.py
@@ -259,13 +263,281 @@ class SerialSensor:
                 pass
 
 
+# ── Hub BLE: un sensor virtual por cada sensor_id en el stream del hub ────────
+
+class VirtualSensor:
+    """
+    Un sensor lógico dentro de un HubConnection.
+
+    Expone la misma interfaz que SerialSensor (snapshot, set_phase,
+    open_csv, close_csv, thread_alive, odr_est, total) para que la
+    ventana principal no necesite distinguir entre modos.
+
+    Los datos son inyectados por HubConnection._dispatch().
+    """
+
+    def __init__(self, sensor_id: int, placement: str):
+        self.sensor_id = sensor_id
+        self.placement = placement
+        # El hilo de lectura pertenece al HubConnection; aquí siempre True
+        # mientras el HubConnection esté vivo.
+        self.thread_alive     = False
+        self.total            = 0
+        self.odr_est          = 0.0
+        self.samples_recorded = 0
+        self.recording        = False
+
+        maxlen = WINDOW_S * SAMPLE_HZ * 2
+        self._times = collections.deque(maxlen=maxlen)
+        self._bufs  = {c: collections.deque(maxlen=maxlen)
+                       for c in ACC_COLS + GYRO_COLS}
+        self._lock   = threading.Lock()
+
+        self._phase      = "none"
+        self._trial_id   = ""
+        self._subject_id = ""
+        self._writer     = None
+        self._csv_file   = None
+
+        self._t0      = None
+        self._odr_ts  = time.monotonic()
+        self._odr_cnt = 0
+
+    # ── API pública (igual que SerialSensor) ──────────────────────────────
+
+    def set_phase(self, phase: str):
+        self._phase = phase
+
+    def open_csv(self, subject_id: str, trial_id: str, out_dir: Path) -> Path:
+        self._subject_id = subject_id
+        self._trial_id   = trial_id
+        ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = (out_dir /
+                 f"{subject_id}_{trial_id}_s{self.sensor_id}_{self.placement}_{ts}.csv")
+        self._csv_file = open(fname, "w", newline="", encoding="utf-8")
+        self._writer   = csv.DictWriter(self._csv_file, fieldnames=COLUMNS)
+        self._writer.writeheader()
+        self.samples_recorded = 0
+        self.recording = True
+        return fname
+
+    def close_csv(self):
+        self.recording = False
+        if self._csv_file:
+            self._csv_file.flush()
+            self._csv_file.close()
+            self._csv_file = None
+            self._writer   = None
+
+    def snapshot(self):
+        with self._lock:
+            t = np.array(self._times)
+            d = {c: np.array(self._bufs[c]) for c in ACC_COLS + GYRO_COLS}
+            return t, d, self.total, self.odr_est
+
+    def close(self):
+        self.close_csv()
+
+    # ── Interno: llamado por HubConnection ───────────────────────────────
+
+    def _dispatch(self, ts_pc: int, ts_ard: int,
+                  ax: float, ay: float, az: float,
+                  gx: float, gy: float, gz: float):
+        if self._t0 is None:
+            self._t0 = ts_ard
+        t_rel = (ts_ard - self._t0) / 1000.0
+
+        with self._lock:
+            self._times.append(t_rel)
+            self._bufs["ax"].append(ax); self._bufs["ay"].append(ay)
+            self._bufs["az"].append(az); self._bufs["gx"].append(gx)
+            self._bufs["gy"].append(gy); self._bufs["gz"].append(gz)
+            self.total    += 1
+            self._odr_cnt += 1
+            now = time.monotonic()
+            if now - self._odr_ts >= 2.0:
+                self.odr_est  = self._odr_cnt / (now - self._odr_ts)
+                self._odr_cnt = 0
+                self._odr_ts  = now
+
+            if self.recording and self._writer:
+                self._writer.writerow({
+                    "timestamp_pc_ms":      ts_pc,
+                    "timestamp_arduino_ms": ts_ard,
+                    "sensor_id":            self.sensor_id,
+                    "placement":            self.placement,
+                    "phase":                self._phase,
+                    "ax": ax, "ay": ay, "az": az,
+                    "gx": gx, "gy": gy, "gz": gz,
+                    "trial_id":   self._trial_id,
+                    "subject_id": self._subject_id,
+                })
+                self.samples_recorded += 1
+
+
+class HubConnection:
+    """
+    Gestiona la conexión USB con un Arduino data_logger_hub.
+
+    Lee un único puerto Serial que multiplexea los datos de N sensores
+    (hub propio + N esclavos BLE) en el formato CSV estándar:
+        timestamp_ms,sensor_id,placement,ax,ay,az,gx,gy,gz
+
+    Cada línea se enruta al VirtualSensor correspondiente según sensor_id.
+    """
+
+    def __init__(self, port: str, sensors: list[VirtualSensor]):
+        self.port     = port
+        self._sensors: dict[int, VirtualSensor] = {s.sensor_id: s for s in sensors}
+        self._ser     = None
+        self._thread  = None
+        self._running = False
+        self.thread_alive = False
+
+    # ── Conexión ──────────────────────────────────────────────────────────
+
+    def connect(self) -> bool:
+        try:
+            self._ser = serial.Serial(self.port, BAUD_RATE, timeout=2.0)
+            time.sleep(0.3)
+            self._ser.reset_input_buffer()
+            return True
+        except Exception as e:
+            print(f"  ERR HubConnection {self.port}: {e}")
+            return False
+
+    def handshake(self, timeout_s: float = 20.0) -> bool:
+        """
+        Espera a que el hub diga READY (después de conectar a sus esclavos BLE).
+        También acepta STATUS: como señal de que el hub está vivo.
+        """
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout_s:
+            self._ser.write(b"STATUS\n")
+            t1 = time.monotonic()
+            while time.monotonic() - t1 < 2.0:
+                raw = self._ser.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line == "READY" or line.startswith("STATUS:"):
+                    print(f"  [Hub] {line}")
+                    return True
+                if line:
+                    print(f"  [Hub] {line}")
+        return False
+
+    def start_stream(self):
+        self._ser.reset_input_buffer()
+        time.sleep(0.05)
+        self._ser.write(b"START\n")
+        print(f"  [Hub] START enviado a {self.port}")
+        self._running     = True
+        self.thread_alive = True
+        for s in self._sensors.values():
+            s.thread_alive = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def stop_stream(self):
+        self._running = False
+        try:
+            self._ser.write(b"STOP\n")
+        except Exception:
+            pass
+
+    def set_phase(self, phase: str):
+        for s in self._sensors.values():
+            s.set_phase(phase)
+
+    def close(self):
+        self._running = False
+        for s in self._sensors.values():
+            s.close_csv()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if self._ser:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+        self.thread_alive = False
+        for s in self._sensors.values():
+            s.thread_alive = False
+
+    # ── Hilo de lectura ───────────────────────────────────────────────────
+
+    def _read_loop(self):
+        try:
+            self._read_loop_inner()
+        except Exception as e:
+            print(f"  [Hub] ERROR en hilo: {e}")
+        finally:
+            self.thread_alive = False
+            for s in self._sensors.values():
+                s.thread_alive = False
+            print("  [Hub] Hilo de lectura terminado")
+
+    def _read_loop_inner(self):
+        diag_lines = 0
+        while self._running:
+            try:
+                raw = self._ser.readline()
+            except serial.SerialException as e:
+                print(f"  [Hub] SerialException: {e}")
+                break
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+
+            # Líneas de control (no CSV)
+            if not line[0].isdigit():
+                print(f"  [Hub] ctrl: {line}")
+                continue
+
+            if diag_lines < 3:
+                print(f"  [Hub] datos: {line[:80]}")
+                diag_lines += 1
+
+            parts = line.split(",")
+            if len(parts) != 9:
+                print(f"  [Hub] línea malformada ({len(parts)} campos): {line[:60]}")
+                continue
+
+            ts_pc = int(time.monotonic_ns() // 1_000_000)
+            try:
+                ts_ard    = int(parts[0])
+                sensor_id = int(parts[1])
+                # parts[2] = placement (usamos el del VirtualSensor)
+                ax = float(parts[3]); ay = float(parts[4]); az = float(parts[5])
+                gx = float(parts[6]); gy = float(parts[7]); gz = float(parts[8])
+            except ValueError as e:
+                print(f"  [Hub] ValueError: {e} en '{line[:60]}'")
+                continue
+
+            vsensor = self._sensors.get(sensor_id)
+            if vsensor is None:
+                # Sensor_id no esperado — imprimir una sola vez
+                if not hasattr(self, '_unknown_ids'):
+                    self._unknown_ids = set()
+                if sensor_id not in self._unknown_ids:
+                    print(f"  [Hub] sensor_id={sensor_id} inesperado, ignorando")
+                    self._unknown_ids.add(sensor_id)
+                continue
+
+            vsensor._dispatch(ts_pc, ts_ard, ax, ay, az, gx, gy, gz)
+
+
 # ── Ventana principal ─────────────────────────────────────────────────────────
 
 class GaitWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.sensors: list[SerialSensor] = []
+        self.sensors: list[SerialSensor | VirtualSensor] = []
+        self._hub_conn: HubConnection | None = None
         self.recording       = False
         self.current_phase   = PHASES[0][0]
         self._setup_ui()
@@ -307,6 +579,16 @@ class GaitWindow(QtWidgets.QMainWindow):
         self.n_spin.setValue(2)
         self.n_spin.setMaximumWidth(50)
         top.addWidget(self.n_spin)
+
+        top.addSpacing(10)
+        self.hub_chk = QtWidgets.QCheckBox("Hub BLE")
+        self.hub_chk.setToolTip(
+            "Modo Hub: un solo Arduino (data_logger_hub) conectado por USB\n"
+            "retransmite los datos de los sensores BLE inalámbricos.\n"
+            "Solo se necesita 1 puerto Serial.")
+        self.hub_chk.setStyleSheet("color:#aaa; font-size:12px;")
+        self.hub_chk.toggled.connect(self._on_hub_mode_toggle)
+        top.addWidget(self.hub_chk)
 
         top.addSpacing(10)
         self.connect_btn = QtWidgets.QPushButton("Conectar")
@@ -491,9 +773,32 @@ class GaitWindow(QtWidgets.QMainWindow):
 
             self._plots.append(sp)
 
+    # ── Hub-mode toggle ───────────────────────────────────────────────────────
+
+    def _on_hub_mode_toggle(self, checked: bool):
+        """Ajusta la UI al cambiar entre modo USB directo y Hub BLE."""
+        self.n_spin.setEnabled(not checked)
+        if checked:
+            # Hub mode: fijar sensores a 3 (hub + 2 esclavos) como punto de partida.
+            # El usuario puede reducirlo a 2 (hub + 1 esclavo).
+            self.n_spin.setValue(min(3, MAX_SENSORS))
+            self.conn_status.setText("● Hub BLE — esperando hub")
+            self.conn_status.setStyleSheet("color:#f39c12; font-weight:bold;")
+        else:
+            self.conn_status.setText("● Desconectado")
+            self.conn_status.setStyleSheet("color:#e74c3c; font-weight:bold;")
+
     # ── Conexión ──────────────────────────────────────────────────────────────
 
     def _on_connect(self):
+        if self.hub_chk.isChecked():
+            self._connect_hub()
+        else:
+            self._connect_direct()
+
+    # ── Modo directo: N Arduinos por USB ──────────────────────────────────────
+
+    def _connect_direct(self):
         n = self.n_spin.value()
 
         ports = sorted(
@@ -514,9 +819,7 @@ class GaitWindow(QtWidgets.QMainWindow):
         self.conn_status.setStyleSheet("color:#f39c12; font-weight:bold;")
         QtWidgets.QApplication.processEvents()
 
-        for s in self.sensors:
-            s.close()
-        self.sensors = []
+        self._close_all()
 
         for i in range(n):
             placement = self.placement_combos[i].currentText()
@@ -531,10 +834,71 @@ class GaitWindow(QtWidgets.QMainWindow):
                 return
             self.sensors.append(s)
 
+        self._finish_connect(n)
+
+    # ── Modo Hub BLE: 1 puerto USB → N sensores virtuales ─────────────────────
+
+    def _connect_hub(self):
+        n = self.n_spin.value()  # número total de sensores esperados (hub + esclavos)
+
+        ports = sorted(
+            p.device for p in serial.tools.list_ports.comports()
+            if "usbmodem" in p.device or "Arduino" in (p.description or "")
+        )
+
+        if not ports:
+            QtWidgets.QMessageBox.warning(
+                self, "Sin puertos",
+                "No se detectó ningún Arduino/hub por USB.\n"
+                "Conecta el hub (data_logger_hub) y vuelve a intentarlo."
+            )
+            return
+
+        self.connect_btn.setEnabled(False)
+        self.conn_status.setText("● Conectando hub…")
+        self.conn_status.setStyleSheet("color:#f39c12; font-weight:bold;")
+        QtWidgets.QApplication.processEvents()
+
+        self._close_all()
+
+        # Crear sensores virtuales con las ubicaciones configuradas en los combos
+        virtual_sensors = []
+        for i in range(n):
+            placement = self.placement_combos[i].currentText()
+            virtual_sensors.append(VirtualSensor(i + 1, placement))
+
+        hub_port = ports[0]
+        hub = HubConnection(hub_port, virtual_sensors)
+
+        if not hub.connect():
+            self._conn_error(f"No se pudo abrir {hub_port}")
+            return
+
+        self.conn_status.setText("● Handshake hub (esperar esclavos BLE)…")
+        QtWidgets.QApplication.processEvents()
+
+        # El hub tarda hasta 15 s × N_SLAVES buscando esclavos antes de decir READY
+        if not hub.handshake(timeout_s=40.0):
+            self._conn_error(
+                f"Hub ({hub_port}) no respondió.\n"
+                "Verifica que esté ejecutando data_logger_hub y que los\n"
+                "sensores BLE estén encendidos (LED azul)."
+            )
+            hub.close()
+            return
+
+        self._hub_conn = hub
+        self.sensors   = virtual_sensors
+
+        self._finish_connect(n)
+
+    # ── Finalizar conexión (común a los dos modos) ────────────────────────────
+
+    def _finish_connect(self, n: int):
         selected_placements = [self.placement_combos[i].currentText() for i in range(n)]
         self._rebuild_plots(n, selected_placements)
 
-        # Crear labels de estado por sensor
+        # Labels de estado por sensor
         for lbl in self.sensor_lbls:
             self.sensor_status_bar.removeWidget(lbl)
             lbl.deleteLater()
@@ -546,14 +910,28 @@ class GaitWindow(QtWidgets.QMainWindow):
             self.sensor_lbls.append(lbl)
         self.sensor_status_bar.addStretch()
 
-        for s in self.sensors:
-            s.start_stream()
+        if self._hub_conn is not None:
+            self._hub_conn.start_stream()
+        else:
+            for s in self.sensors:
+                s.start_stream()
 
-        self.conn_status.setText(f"● {n} sensor(es) conectados")
+        mode_tag = " (Hub BLE)" if self.hub_chk.isChecked() else ""
+        self.conn_status.setText(f"● {n} sensor(es) conectados{mode_tag}")
         self.conn_status.setStyleSheet("color:#2ecc71; font-weight:bold;")
         self.record_btn.setEnabled(True)
         self.connect_btn.setEnabled(True)
         self._select_phase(PHASES[0][0])
+
+    # ── Cerrar todas las conexiones ───────────────────────────────────────────
+
+    def _close_all(self):
+        for s in self.sensors:
+            s.close()
+        self.sensors = []
+        if self._hub_conn is not None:
+            self._hub_conn.close()
+            self._hub_conn = None
 
     def _conn_error(self, msg: str):
         QtWidgets.QMessageBox.critical(self, "Error de conexión", msg)
@@ -565,6 +943,8 @@ class GaitWindow(QtWidgets.QMainWindow):
 
     def _select_phase(self, phase_id: str):
         self.current_phase = phase_id
+        if self._hub_conn is not None:
+            self._hub_conn.set_phase(phase_id)
         for s in self.sensors:
             s.set_phase(phase_id)
         for i, (pid, label, color) in enumerate(PHASES):
@@ -675,8 +1055,7 @@ class GaitWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         if self.recording:
             self._stop_recording()
-        for s in self.sensors:
-            s.close()
+        self._close_all()
         event.accept()
 
 
