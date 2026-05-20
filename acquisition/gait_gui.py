@@ -46,7 +46,9 @@ PHASES = [
     ("swing",     "4 · Swing",             "#3498db"),
 ]
 
-PLACEMENTS = ["pelvis", "thigh", "ankle"]
+PLACEMENTS         = ["pelvis", "thigh", "ankle"]        # defaults internos
+PLACEMENT_OPTIONS  = ["cadera", "pierna", "peroné", "tobillo"]
+PLACEMENT_DEFAULTS = ["cadera", "pierna", "tobillo"]     # default por sensor
 
 COLUMNS = [
     "timestamp_pc_ms", "timestamp_arduino_ms",
@@ -325,6 +327,40 @@ class GaitWindow(QtWidgets.QMainWindow):
 
         root.addLayout(top)
 
+        # ── Fila de ubicación de sensores ─────────────────────────────────
+        placement_bar = QtWidgets.QHBoxLayout()
+        placement_bar.setContentsMargins(0, 0, 0, 0)
+        placement_bar.setSpacing(8)
+
+        placement_bar.addWidget(self._label("Ubicación:"))
+
+        self.placement_combos: list[QtWidgets.QComboBox] = []
+        self._placement_labels: list[QtWidgets.QLabel] = []
+        for i in range(3):
+            lbl = self._label(f"S{i+1}:")
+            lbl.setStyleSheet("color:#aaa; font-size:12px;")
+            self._placement_labels.append(lbl)
+            placement_bar.addWidget(lbl)
+
+            combo = QtWidgets.QComboBox()
+            combo.addItems(PLACEMENT_OPTIONS)
+            combo.setCurrentText(PLACEMENT_DEFAULTS[i])
+            combo.setMinimumWidth(110)
+            combo.setStyleSheet(
+                "QComboBox { background:#16213e; color:#eee; border:1px solid #555;"
+                " border-radius:3px; padding:3px 8px; font-size:12px; }"
+                "QComboBox QAbstractItemView { background:#16213e; color:#eee;"
+                " selection-background-color:#3498db; }"
+            )
+            self.placement_combos.append(combo)
+            placement_bar.addWidget(combo)
+
+        placement_bar.addStretch()
+        self.n_spin.valueChanged.connect(self._update_placement_visibility)
+        self._update_placement_visibility(self.n_spin.value())
+
+        root.addLayout(placement_bar)
+
         # ── Plots ─────────────────────────────────────────────────────────
         pg.setConfigOptions(antialias=True, background="#12121f", foreground="#ddd")
         self.plot_widget = pg.GraphicsLayoutWidget()
@@ -401,6 +437,13 @@ class GaitWindow(QtWidgets.QMainWindow):
         self.sensor_lbls: list[QtWidgets.QLabel] = []
         root.addLayout(self.sensor_status_bar)
 
+    def _update_placement_visibility(self, n: int):
+        for i, (lbl, combo) in enumerate(
+                zip(self._placement_labels, self.placement_combos)):
+            visible = i < n
+            lbl.setVisible(visible)
+            combo.setVisible(visible)
+
     # ── Helpers UI ────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -418,11 +461,12 @@ class GaitWindow(QtWidgets.QMainWindow):
         return ("background:#c0392b; color:white; font-weight:bold; "
                 "font-size:14px; border-radius:4px; padding:8px 24px;")
 
-    def _rebuild_plots(self, n: int):
+    def _rebuild_plots(self, n: int, placements: list[str] | None = None):
         self.plot_widget.clear()
         self._plots = []
         for col in range(n):
-            place = PLACEMENTS[col]
+            place = (placements[col] if placements and col < len(placements)
+                     else PLACEMENTS[col] if col < len(PLACEMENTS) else f"S{col+1}")
             sp = {}
 
             p_acc = self.plot_widget.addPlot(row=0, col=col,
@@ -475,7 +519,8 @@ class GaitWindow(QtWidgets.QMainWindow):
         self.sensors = []
 
         for i in range(n):
-            s = SerialSensor(ports[i], i + 1, PLACEMENTS[i])
+            placement = self.placement_combos[i].currentText()
+            s = SerialSensor(ports[i], i + 1, placement)
             if not s.connect():
                 self._conn_error(f"No se pudo abrir {ports[i]}")
                 return
@@ -486,7 +531,8 @@ class GaitWindow(QtWidgets.QMainWindow):
                 return
             self.sensors.append(s)
 
-        self._rebuild_plots(n)
+        selected_placements = [self.placement_combos[i].currentText() for i in range(n)]
+        self._rebuild_plots(n, selected_placements)
 
         # Crear labels de estado por sensor
         for lbl in self.sensor_lbls:
