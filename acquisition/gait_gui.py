@@ -4,10 +4,11 @@ gait_gui.py — Interfaz de adquisición de marcha por fases.
 
 Modos de operación
 ──────────────────
-• USB directo (por defecto): conecta N Arduinos por USB independientes.
-• Hub BLE (checkbox "Hub BLE"): conecta 1 Arduino hub (data_logger_hub)
-  que retransmite datos de hasta 2 sensores BLE inalámbricos y su propia
-  IMU, todo por un único puerto USB Serial.
+• USB directo   : conecta N Arduinos por USB independientes.
+• Hub BLE       : 1 Arduino hub (data_logger_hub) por USB retransmite
+                  datos de hasta 2 sensores BLE inalámbricos.
+• Mac BLE       : la Mac actúa directamente como hub BLE (bleak);
+                  no se necesita ningún Arduino conectado por USB.
 
 Uso:
     python3.11 acquisition/gait_gui.py
@@ -20,11 +21,13 @@ Teclas:
     Space → Toggle grabar / detener
 
 Requiere:
-    pip install pyqtgraph PyQt6 pyserial numpy
+    pip install pyqtgraph PyQt6 pyserial numpy bleak
 """
 
+import asyncio
 import collections
 import csv
+import struct
 import sys
 import threading
 import time
@@ -530,6 +533,180 @@ class HubConnection:
             vsensor._dispatch(ts_pc, ts_ard, ax, ay, az, gx, gy, gz)
 
 
+# ── Mac BLE: la Mac actúa como hub usando bleak ───────────────────────────────
+
+# Sensores BLE de adquisición (data_logger_ble_sensor)
+BLE_ACQ_SERVICE = "19b20000-e8f2-537e-4f6c-d104768a1214"
+BLE_ACQ_IMU_CHR = "19b20001-e8f2-537e-4f6c-d104768a1214"
+
+# Configuración de cada sensor BLE: nombre anunciado, sensor_id, placement default.
+# Ajusta los placements en la GUI antes de conectar.
+BLE_SENSOR_CONFIGS = [
+    {"name": "GaitNode_2", "sensor_id": 2, "placement": "pierna"},
+    {"name": "GaitNode_3", "sensor_id": 3, "placement": "cadera"},
+]
+
+
+class BleakHubConnection:
+    """
+    Usa el Bluetooth interno de la Mac como hub BLE (sin Arduino USB).
+
+    Conecta a los sensores GaitNode_* via bleak en un hilo con su propio
+    event loop asyncio. Los datos llegan por notificación BLE y se despachan
+    a los VirtualSensor correspondientes.
+
+    Protocolo de uso (igual que HubConnection):
+        conn = BleakHubConnection(sensors, names)
+        conn.connect()         → True siempre
+        conn.handshake(30)     → bloquea hasta que ≥1 sensor conecta (o timeout)
+        conn.start_stream()    → no-op (el loop corre desde handshake)
+        conn.set_phase(phase)
+        conn.close()
+    """
+
+    def __init__(self, sensors: list[VirtualSensor], names: list[str],
+                 scan_timeout: float = 15.0):
+        self._vsensors    = sensors          # orden = orden de names
+        self._names       = names            # ["GaitNode_2", "GaitNode_3", ...]
+        self._scan_timeout = scan_timeout
+
+        self._loop    = None
+        self._thread  = None
+        self._running = False
+        self.thread_alive = False
+        self._clients: list = []
+
+        # Se dispara en cuanto ≥1 sensor conecta exitosamente
+        self._ready_event = threading.Event()
+
+    # ── API pública ───────────────────────────────────────────────────────────
+
+    def connect(self) -> bool:
+        return True  # no hay puerto serial que abrir
+
+    def handshake(self, timeout_s: float = 30.0) -> bool:
+        """Arranca el loop BLE y espera a que al menos 1 sensor se conecte."""
+        self._running     = True
+        self.thread_alive = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        ok = self._ready_event.wait(timeout=timeout_s)
+        if not ok:
+            print("  [MacBLE] Timeout: ningún sensor conectó en el tiempo límite")
+        return ok
+
+    def start_stream(self):
+        # El loop ya corre desde handshake(); aquí solo marcamos los vsensors
+        for s in self._vsensors:
+            s.thread_alive = True
+
+    def stop_stream(self):
+        pass  # la GUI controla grabación; el stream BLE sigue corriendo
+
+    def set_phase(self, phase: str):
+        for s in self._vsensors:
+            s.set_phase(phase)
+
+    def close(self):
+        self._running = False
+        for s in self._vsensors:
+            s.close_csv()
+        # Pedir al loop que se detenga desde su propio hilo
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread:
+            self._thread.join(timeout=5.0)
+        self.thread_alive = False
+        for s in self._vsensors:
+            s.thread_alive = False
+
+    # ── Loop asyncio en hilo separado ─────────────────────────────────────────
+
+    def _run_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._ble_main())
+        except Exception as e:
+            print(f"  [MacBLE] Error en loop asyncio: {e}")
+        finally:
+            self.thread_alive = False
+            for s in self._vsensors:
+                s.thread_alive = False
+            print("  [MacBLE] Loop BLE terminado")
+
+    async def _ble_main(self):
+        from bleak import BleakScanner, BleakClient
+
+        # Conectar a cada sensor en paralelo
+        tasks = [
+            self._connect_sensor(BleakScanner, BleakClient, name, vsensor)
+            for name, vsensor in zip(self._names, self._vsensors)
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Mantener el loop vivo mientras haya clientes conectados
+        while self._running:
+            await asyncio.sleep(0.5)
+            # Detectar desconexiones
+            for client, vsensor in zip(self._clients, self._vsensors):
+                if not client.is_connected:
+                    vsensor.thread_alive = False
+
+        # Desconectar limpiamente
+        for client in self._clients:
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                pass
+
+    async def _connect_sensor(self, BleakScanner, BleakClient,
+                               name: str, vsensor: VirtualSensor):
+        print(f"  [MacBLE] Buscando {name} (timeout {self._scan_timeout}s)…")
+        device = await BleakScanner.find_device_by_name(
+            name, timeout=self._scan_timeout)
+
+        if device is None:
+            print(f"  [MacBLE] {name} no encontrado")
+            return
+
+        print(f"  [MacBLE] Encontrado {name} @ {device.address}")
+
+        def on_disconnect(client):
+            print(f"  [MacBLE] {name} desconectado")
+            vsensor.thread_alive = False
+
+        client = BleakClient(device, disconnected_callback=on_disconnect)
+
+        try:
+            await client.connect()
+        except Exception as e:
+            print(f"  [MacBLE] Error al conectar {name}: {e}")
+            return
+
+        def make_notify_cb(vs):
+            def cb(sender, data: bytearray):
+                if len(data) != 24:
+                    return
+                ax, ay, az, gx, gy, gz = struct.unpack('<6f', bytes(data))
+                ts_pc = int(time.monotonic_ns() // 1_000_000)
+                vs._dispatch(ts_pc, ts_pc, ax, ay, az, gx, gy, gz)
+            return cb
+
+        try:
+            await client.start_notify(BLE_ACQ_IMU_CHR, make_notify_cb(vsensor))
+        except Exception as e:
+            print(f"  [MacBLE] Error al suscribir {name}: {e}")
+            await client.disconnect()
+            return
+
+        self._clients.append(client)
+        vsensor.thread_alive = True
+        print(f"  [MacBLE] {name} conectado y suscrito — datos fluyendo")
+        self._ready_event.set()   # al menos 1 sensor listo
+
+
 # ── Ventana principal ─────────────────────────────────────────────────────────
 
 class GaitWindow(QtWidgets.QMainWindow):
@@ -581,14 +758,18 @@ class GaitWindow(QtWidgets.QMainWindow):
         top.addWidget(self.n_spin)
 
         top.addSpacing(10)
-        self.hub_chk = QtWidgets.QCheckBox("Hub BLE")
-        self.hub_chk.setToolTip(
-            "Modo Hub: un solo Arduino (data_logger_hub) conectado por USB\n"
-            "retransmite los datos de los sensores BLE inalámbricos.\n"
-            "Solo se necesita 1 puerto Serial.")
-        self.hub_chk.setStyleSheet("color:#aaa; font-size:12px;")
-        self.hub_chk.toggled.connect(self._on_hub_mode_toggle)
-        top.addWidget(self.hub_chk)
+        top.addWidget(self._label("Modo:"))
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItems(["USB directo", "Hub BLE (Arduino)", "Mac BLE (Bluetooth)"])
+        self.mode_combo.setMinimumWidth(170)
+        self.mode_combo.setStyleSheet(
+            "QComboBox { background:#16213e; color:#eee; border:1px solid #555;"
+            " border-radius:3px; padding:3px 8px; font-size:12px; }"
+            "QComboBox QAbstractItemView { background:#16213e; color:#eee;"
+            " selection-background-color:#3498db; }"
+        )
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_change)
+        top.addWidget(self.mode_combo)
 
         top.addSpacing(10)
         self.connect_btn = QtWidgets.QPushButton("Conectar")
@@ -773,28 +954,37 @@ class GaitWindow(QtWidgets.QMainWindow):
 
             self._plots.append(sp)
 
-    # ── Hub-mode toggle ───────────────────────────────────────────────────────
+    # ── Cambio de modo ────────────────────────────────────────────────────────
 
-    def _on_hub_mode_toggle(self, checked: bool):
-        """Ajusta la UI al cambiar entre modo USB directo y Hub BLE."""
-        self.n_spin.setEnabled(not checked)
-        if checked:
-            # Hub mode: fijar sensores a 3 (hub + 2 esclavos) como punto de partida.
-            # El usuario puede reducirlo a 2 (hub + 1 esclavo).
+    def _on_mode_change(self, idx: int):
+        mode = self.mode_combo.currentText()
+        if mode == "USB directo":
+            self.n_spin.setEnabled(True)
+            self.n_spin.setRange(1, MAX_SENSORS)
+        elif mode == "Hub BLE (Arduino)":
+            self.n_spin.setEnabled(True)
+            self.n_spin.setRange(1, MAX_SENSORS)
             self.n_spin.setValue(min(3, MAX_SENSORS))
-            self.conn_status.setText("● Hub BLE — esperando hub")
-            self.conn_status.setStyleSheet("color:#f39c12; font-weight:bold;")
-        else:
-            self.conn_status.setText("● Desconectado")
-            self.conn_status.setStyleSheet("color:#e74c3c; font-weight:bold;")
+        else:  # Mac BLE
+            # Máximo = número de sensores BLE configurados
+            max_ble = len(BLE_SENSOR_CONFIGS)
+            self.n_spin.setEnabled(True)
+            self.n_spin.setRange(1, max_ble)
+            self.n_spin.setValue(max_ble)
+
+        self.conn_status.setText("● Desconectado")
+        self.conn_status.setStyleSheet("color:#e74c3c; font-weight:bold;")
 
     # ── Conexión ──────────────────────────────────────────────────────────────
 
     def _on_connect(self):
-        if self.hub_chk.isChecked():
+        mode = self.mode_combo.currentText()
+        if mode == "USB directo":
+            self._connect_direct()
+        elif mode == "Hub BLE (Arduino)":
             self._connect_hub()
         else:
-            self._connect_direct()
+            self._connect_mac_ble()
 
     # ── Modo directo: N Arduinos por USB ──────────────────────────────────────
 
@@ -892,6 +1082,52 @@ class GaitWindow(QtWidgets.QMainWindow):
 
         self._finish_connect(n)
 
+    # ── Modo Mac BLE: Mac como hub Bluetooth directo ──────────────────────────
+
+    def _connect_mac_ble(self):
+        n = min(self.n_spin.value(), len(BLE_SENSOR_CONFIGS))
+
+        self.connect_btn.setEnabled(False)
+        self.conn_status.setText("● Buscando sensores BLE…")
+        self.conn_status.setStyleSheet("color:#f39c12; font-weight:bold;")
+        QtWidgets.QApplication.processEvents()
+
+        self._close_all()
+
+        # Crear VirtualSensors con los IDs y placements del BLE_SENSOR_CONFIGS,
+        # pero usando la ubicación que el usuario tiene en los combos.
+        virtual_sensors = []
+        for i in range(n):
+            cfg       = BLE_SENSOR_CONFIGS[i]
+            placement = self.placement_combos[i].currentText()
+            virtual_sensors.append(VirtualSensor(cfg["sensor_id"], placement))
+
+        names = [BLE_SENSOR_CONFIGS[i]["name"] for i in range(n)]
+
+        hub = BleakHubConnection(virtual_sensors, names, scan_timeout=15.0)
+        hub.connect()  # siempre True
+
+        # handshake() arranca el loop BLE y bloquea hasta que ≥1 sensor conecta
+        # (máx 15 s × n sensores en paralelo, no secuencial)
+        self.conn_status.setText(
+            f"● Buscando {', '.join(names)}…  (hasta 15 s)")
+        QtWidgets.QApplication.processEvents()
+
+        if not hub.handshake(timeout_s=20.0):
+            self._conn_error(
+                "Ningún sensor BLE respondió en 20 s.\n\n"
+                "Verifica que los sensores estén encendidos (LED azul)\n"
+                "y ejecutando data_logger_ble_sensor.\n\n"
+                f"Nombres esperados: {', '.join(names)}"
+            )
+            hub.close()
+            return
+
+        self._hub_conn = hub
+        self.sensors   = virtual_sensors
+
+        self._finish_connect(n)
+
     # ── Finalizar conexión (común a los dos modos) ────────────────────────────
 
     def _finish_connect(self, n: int):
@@ -916,7 +1152,8 @@ class GaitWindow(QtWidgets.QMainWindow):
             for s in self.sensors:
                 s.start_stream()
 
-        mode_tag = " (Hub BLE)" if self.hub_chk.isChecked() else ""
+        mode = self.mode_combo.currentText()
+        mode_tag = "" if mode == "USB directo" else f" ({mode})"
         self.conn_status.setText(f"● {n} sensor(es) conectados{mode_tag}")
         self.conn_status.setStyleSheet("color:#2ecc71; font-weight:bold;")
         self.record_btn.setEnabled(True)
