@@ -189,7 +189,7 @@ static bool tryConnectNext() {
         return false;
     }
 
-    slave_chars[idx].setEventHandler(BLEValueUpdated, SLAVE_CBS[idx]);
+    slave_chars[idx].setEventHandler(BLEUpdated, SLAVE_CBS[idx]);
     slave_chars[idx].subscribe();
     Serial.print("STATUS:SLAVE_CONNECTED "); Serial.println(SLAVE_NAMES[idx]);
 

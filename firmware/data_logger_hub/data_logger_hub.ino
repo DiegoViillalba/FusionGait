@@ -178,7 +178,7 @@ static bool tryConnectNext() {
         if (found.connect() && found.discoverAttributes()) {
             BLECharacteristic ch = found.characteristic(BLE_IMU_UUID);
             if (ch && ch.canSubscribe()) {
-                ch.setEventHandler(BLEValueUpdated, SLAVE_CBS[idx]);
+                ch.setEventHandler(BLEUpdated, SLAVE_CBS[idx]);
                 ch.subscribe();
                 slave_devs[idx]  = found;
                 slave_chars[idx] = ch;
