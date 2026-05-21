@@ -30,7 +30,7 @@ training/models/*.h5
 training/models/*.keras
 
 # Datos crudos (no versionar CSVs de captura)
-data/raw/*.csv
+#data/raw/*.csv
 
 # Artefactos de build Arduino
 *.elf
