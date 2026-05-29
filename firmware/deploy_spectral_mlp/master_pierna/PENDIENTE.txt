@@ -1,0 +1,2 @@
+Después de re-entrenar, ejecutar add_spectral_pipeline.py
+y copiar aquí los archivos de firmware/inference_master/src/

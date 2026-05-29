@@ -23,8 +23,12 @@
 #define BLE_IMU_UUID     "19B10001-E8F2-537E-4F6C-D104768A1214"
 
 // ── Modelo TinyML ─────────────────────────────────────────────────────────
-#define WINDOW_SIZE      50
-#define STEP             10   // hop reducido → más inferencias por segundo
+// Frecuencia de muestreo real del BMI270 (medida en datos de entrenamiento: 16 ms/muestra)
+#define SAMPLE_MS        16
+#define SAMPLE_HZ        62             // 1000/16 = 62.5 → truncado a 62
+
+#define WINDOW_SIZE      120            // 120 × 16 ms = 1.92 s de ventana
+#define STEP             10             // inferencia cada 160 ms
 #define N_FEATURES       (6 * (1 + N_SLAVES))   // 12 con 1 esclavo
 #define N_CLASSES        4
 

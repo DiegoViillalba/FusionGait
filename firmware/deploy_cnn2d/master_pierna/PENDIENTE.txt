@@ -1,0 +1,4 @@
+Después de re-entrenar el notebook, copiar aquí:
+  training/models/gait_model.h  → gait_model.h
+  training/models/scaler.h      → scaler.h
+O ejecutar: python3 scripts/export_to_arduino.py

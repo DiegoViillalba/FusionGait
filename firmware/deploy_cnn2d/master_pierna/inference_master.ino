@@ -322,14 +322,23 @@ void loop() {
     // Consumir flags atómicamente
     for (int i = 0; i < N_SLAVES; i++) slave_ready[i] = false;
 
-    // ── 4. Construir muestra: [master | slave0 | slave1 | ...] ───────────
+    // ── 4. Construir muestra: [slave0(tobillo,s1) | master(pierna,s2)] ──────
+    // IMPORTANTE: el modelo fue entrenado con FEAT_COLS=[s1,s2]
+    //   features[0..5]  = tobillo (sensor_id=1) = slave_imu[0]
+    //   features[6..11] = pierna  (sensor_id=2) = master propio
     float sample[N_FEATURES];
-    sample[0] = ax1; sample[1] = ay1; sample[2] = az1;
-    sample[3] = gx1; sample[4] = gy1; sample[5] = gz1;
-    for (int s = 0; s < N_SLAVES; s++) {
+    // Primero el slave tobillo (s1)
+    for (int f = 0; f < 6; f++)
+        sample[f] = (float)slave_imu[0][f];
+    // Luego el master pierna (s2) — y cualquier esclavo adicional
+    sample[6] = ax1; sample[7] = ay1; sample[8] = az1;
+    sample[9] = gx1; sample[10] = gy1; sample[11] = gz1;
+#if N_SLAVES >= 2
+    for (int s = 1; s < N_SLAVES; s++) {
         for (int f = 0; f < 6; f++)
-            sample[6 + s * 6 + f] = (float)slave_imu[s][f];
+            sample[12 + (s - 1) * 6 + f] = (float)slave_imu[s][f];
     }
+#endif
     normalise(sample);
 
     // ── 5. Ring buffer ───────────────────────────────────────────────────
